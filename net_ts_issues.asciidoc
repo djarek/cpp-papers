@@ -1,0 +1,192 @@
+# Library author's implementation experience with the Networking TS
+Damian Jarek <damian.jarek93@gmail.com>
+:toc: macro
+
+[horizontal]
+Document Number:: DXXXXR0
+Date:: 2019-01-18
+Project:: Programming Language C++
+Audience:: Library Evolution Working Group
+Summary:: This paper presents library implementation experience when working with the Networking TS
+
+toc::[]
+
+## Overview
+This paper presents a number of issues encountered when implementing
+high-performance, generic library components (mostly in Boost.Beast) based on
+top of the reference implementation of the Networking TS in the Boost.ASIO
+library.
+
+The overall experience with using the Networking TS as a "base" has been
+positive. Unfortunately, networking at this level of abstraction is quite a
+complex topic and often confuses even experienced engineers. However, moving the
+TS "up" in terms of abstraction would come at a compromise to customizability,
+generality and performance. High-level, 3rd party libraries, built on top of the
+Networking TS, should be able to satisfy the the most common cases in a concise
+way.
+
+The problems, presented in the rest of this paper, require only minor changes to
+the Networking TS.
+
+## 1) Allow CompletionCondition to indicate an error code.
+Implementing parsing algorithms for protocols that work on top of a byte stream,
+like TCP/IP, often requires an *online* algorithm. Such an algorithm is able to
+process octets, read into a buffer, without having access to the entire input.
+This enables saving runtime resources (mostly memory) by facilitating the reuse
+of a single input buffer. Let us consider the following function object, which
+satisfies the constraints of CompletionCondition and represents a very
+simplified algorithm:
+
+```c++
+namespace net = std::experimental::net;
+
+template<class DynamicBuffer>
+struct condition
+{
+    void operator()(std::error_code const& ec, std::size_t n)
+    {
+        std::uint8_t message_type = 0xFF;
+        net::buffer_copy(
+            net::buffer(&message_type, sizeof(type)),
+            db.data());
+
+        switch (message_type)
+        {
+            case 0x00:
+                // Not an error, the user gets a "success" error_code
+                return 0;
+            case 0x01:
+                // Not an error, the user gets a "success" error_code
+                return 0;
+            default:
+                // Is an error, we have no way of signalling
+                // that an error occurred.
+                return 0;
+        }
+    }
+
+    DynamicBuffer& db_;
+};
+```
+The problem encountered here is that the user of a networking algorithm (e.g.
+`net::read()`) has no way of knowing whether the algorithm completed because the
+condition was satisfied successfully or whether the condition encountered an
+irrecoverable error when parsing the input and stopped early. In order to solve
+this, the CompletionCondition has to be allowed to accept the error code
+argument by non-const reference, thus allowing it to pass the error back to the
+caller.
+
+## 2) Move-only CompletionConditions
+The Networking TS currently requires CompletionConditions to be
+CopyConstructible. This requirement is unnecessary, because CompletionConditions
+are stored as a member of composed operations, which are only required to
+satisfy the requirements of MoveConstructible. This change allows users to
+create CompletionConditions that are expensive to copy (or not Copyable at all),
+but cheap to move.
+
+## 3) Clarify ownership semantics of asynchronous initiation function arguments
+
+The Networking TS specifies that "caller owned" arguments of asynchronous
+initiation functions must remain valid until the operation's completion handler
+is invoked (*[async.reqmts.async.lifetime]*). However, the TS does not mention
+the lifetime requirements for operations that are never invoked. This most
+commonly happens when pending operations are "abandoned" in
+`ExecutionContext::shutdown()`.
+
+An operation is considered abandoned if a copy of the operation's completion
+handler, that was never invoked and never moved-from, has been destroyed.
+With this definition, we can clarify the requirements to necessitate the
+validity of caller-owned arguments until the operation's completion handler is
+abandoned or invoked, whatever comes first.
+
+Note that an operation can also be abandoned if the attempt to complete it
+(using `ex2.dispatch()`) results in an exception being thrown before invocation
+(e.g. when performing dynamic allocation of temporary storage). This has a
+counter-intuitive implication, that the destructor of a non-moved-from,
+non-invoked copy of a completion handler can be destroyed outside the context of
+a user's executor.
+
+## 4) Exception safety during deallocation of temporary storage
+
+Asynchronous operations are allowed by the TS to allocate temporary storage that
+is release before invocation of the operation's completion handler. When
+performing this deallocation step, whether it happens before invocation or
+abandonment, the implementation has to move the handler out of the temporary
+storage:
+
+```c++
+Handler deallocate(temporary_storage<Handler>* storage)
+{
+    allocator_type alloc{net::get_associated_allocator(storage->handler_)};
+    std::allocator_traits<allocator_type> traits;
+    auto h = std::move(storage->handler_); // can throw
+    traits.destroy(alloc, storage);
+    traits.deallocate(alloc, storage, 1);
+    return h;
+}
+```
+
+CompletionHandlers are MoveConstructible, which implies their move constructors
+can throw. The problem this creates, is that move constructors of handlers are
+often invoked in "cleanup" contexts. In the above example, the exception thrown
+out of the move constructor would propagate out to the caller, but it results in
+a memory leak. The leak cannot be solved with either RAII or a `catch` clause,
+because by the time we catch the exception or execute a destructor we do not
+have access to a non-moved-from, non-invoked copy of the handler, therefore we
+have to assume that the memory resource represented by the allocator is no
+longer valid:
+
+```c++
+Handler deallocate(temporary_storage<Handler>* storage)
+{
+    allocator_type alloc{net::get_associated_allocator(storage->handler_)};
+    std::allocator_traits<allocator_type> traits;
+    try {
+        auto h = std::move(storage->handler_); // can throw
+        traits.destroy(alloc, storage);
+        traits.deallocate(alloc, storage, 1);
+        return h;
+    } catch(...) {
+        // alloc may no longer be valid
+        traits.destroy(alloc, storage);
+        // even if alloc was still valid and the ownership remained in the source,
+        // we just destroyed it, so the next line uses an allocator which
+        // may not refer to a valid memory resource
+        traits.deallocate(alloc, storage, 1);
+        throw;
+    }
+}
+```
+
+There are multiple ways of solving this issue:
+
+- require that the allocator copy have shared ownership of the memory resource
+or that the handler does not participate in ownership of the memory resource at all
+- disallow throwing move constructors
+- allow the implementation to call the move constructor in a `noexcept`
+context (effectively means that handler move constructors can can throw, but may
+result in termination in some contexts).
+
+The first option severly limits the usage patterns of allocators associated with
+a completion handlers and misuse is impossible to detect.
+
+The second one, requiring that completion handlers are nothrow move
+constructible makes it impossible to use some standard library types as data
+members of a composed operation's state machine, assuming the move constructor
+is compiler-synthesized.
+
+The last one seems to allow most flexibility in terms of usage patterns of
+associated allocators. Note that calls to move constructors of completion
+handlers may occur in contexts, in which an exception being thrown already
+results in termination. An example of such a context would be a completion
+handler being moved in a call to `net::dispatch()` when the operation completes,
+which can be performed by a private thread spawned by the implementation.
+
+## 5) Lack of ordering guarantees of a single-threaded `io_context`
+
+A very common pattern of usage in application based on the Networking TS is
+using an "implicit strand". The user makes sure that no data races occur, by
+only allowing at most one thread to run completion handlers on a particular
+ExecutionContext. The problem is that `io_context` lacks ordering guarantees in
+the single-threaded case, which might be problematic to some higher-level
+components built on top of it, that assume ordering.

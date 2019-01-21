@@ -47,7 +47,7 @@ namespace net = std::experimental::net;
 template<class DynamicBuffer>
 struct condition
 {
-    void operator()(std::error_code const& ec, std::size_t n)
+    std::size_t operator()(std::error_code const& ec, std::size_t n)
     {
         std::uint8_t message_type = 0xFF;
         net::buffer_copy(
@@ -80,7 +80,7 @@ irrecoverable error when parsing the input and stopped early.
 
 .Suggested actions:
 - Allow the CompletionCondition to accept an `error_code&` as its first argument.
-- Guarantee that changes done to the error code via the condition's first argument are propagated to the caller (in case of synchronous algorithms) or completion handler(asynchronous algorithms).
+- Guarantee that changes made to the error code via the condition's first argument are propagated to the caller (in case of synchronous algorithms) or completion handler(asynchronous algorithms).
 
 == CompletionCondition requires CopyConstructible
 This requirement is unnecessary, because CompletionConditions
@@ -93,7 +93,7 @@ efficiently reusing temporary storage, which might sometimes be necessary:
 template<class DynamicBuffer>
 struct condition
 {
-    void operator()(std::error_code const& ec, std::size_t n);
+    std::size_t operator()(std::error_code const ec, std::size_t n);
 
     DynamicBuffer& db_;
     // Temporary storage that is used for parsing and potentially too large to be
@@ -136,7 +136,7 @@ context of a user's executor.
 - Require that completion handler's move constructor and destructor do not introduce data races
 if invoked outside its associated executor's context. This allows implementations of ExecutionContexts to properly handle exceptions being thrown in threads not visible to the user.
 
-== Exception safety during deallocation of temporary storage
+== Exception safety of temporary storage deallocation
 
 Allocations made through a completion handler's associated allocator must be
 deallocated before the completion handler is invoked. When performing this
@@ -180,7 +180,7 @@ Handler release_handler(temporary_storage<Handler>* storage)
     } catch(...) {
         // alloc may no longer be valid
         traits.destroy(alloc, storage);
-        // even if alloc was still valid and the ownership remained in the source,
+        // even if alloc was still valid and the ownership remained in the source object,
         // we just destroyed it, so the next line uses an allocator which
         // may not refer to a valid memory resource
         traits.deallocate(alloc, storage, 1);

@@ -197,7 +197,7 @@ or that the handler does not participate in ownership of the memory resource at 
 context (effectively means that handler move constructors can can throw, but may
 result in termination in some contexts).
 
-The first option severly limits the usage patterns of allocators associated with
+The first option severely limits the usage patterns of allocators associated with
 a completion handlers and misuse is impossible to detect.
 
 The second one, requires the author of a composed operation's state machine to
@@ -238,7 +238,7 @@ guarantees even for this implicitly synchronized case. It is unlikely the implem
 gain anything by using LIFO ordering for executing completion handlers.
 
 .Suggested actions:
-- Provide an ordering guarante for `io_context` if it only has 1 thread running it.
+- Provide an ordering guarantee for `io_context` if it only has 1 thread running it.
 
 :!numbered:
 == Acknowledgements
